@@ -126,8 +126,29 @@ claude-skip() {
   _claude_profile_launch "$tag" --dangerously-skip-permissions "$@"
 }
 
+# Claude Code migrations occasionally rewrite old transcript metadata in
+# bulk, refreshing mtimes without new content; /resume then sorts long-dead
+# sessions to the top as "1 minute ago". Repair: backdate any file whose
+# mtime is >10min newer than its newest content timestamp back to that
+# content time. Scans the last 24h of mtimes; active sessions are protected
+# by the 10-minute guard.
+_claude_transcript_timefix() {
+  local f ts epoch mt fixed=0
+  while IFS= read -r f; do
+    ts=$(tail -5 "$f" | jq -r '.timestamp // empty' 2>/dev/null | tail -1)
+    [ -n "$ts" ] || continue
+    epoch=$(date -ju -f '%Y-%m-%dT%H:%M:%S' "${ts%%.*}" +%s 2>/dev/null) || continue
+    mt=$(stat -f %m "$f")
+    if [ $((mt - epoch)) -gt 600 ]; then
+      touch -t "$(date -r "$epoch" '+%Y%m%d%H%M.%S')" "$f" && fixed=$((fixed+1))
+    fi
+  done < <(find "$HOME/.claude/projects" -name "*.jsonl" -maxdepth 2 -mmin -1440 2>/dev/null)
+  echo "transcript timefix: $fixed file(s) backdated to their real last activity"
+}
+
 claude-doctor() {
   local t
+  _claude_transcript_timefix
   for t in $CLAUDE_PROFILES; do
     echo "-- $t --"
     _claude_profile_heal "$t"
