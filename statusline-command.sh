@@ -21,6 +21,33 @@ five_hour_resets=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // em
 seven_day_resets=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
 current_dir=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // empty')
 
+# --- shared per-account usage cache ---
+# The background usage poll (below) stores the full usage-API response per
+# account. When fresh (<5 min), row 2 renders 5h/wk from it instead of the
+# session-fed rate_limits: every terminal of the same account then shows the
+# same account-true numbers, kept fresh by whichever session is active.
+# Stale/missing cache -> session feed.
+_iso2epoch() {
+  date -ju -f '%Y-%m-%dT%H:%M:%S' "$(printf '%s' "$1" | sed -E 's/\.[0-9]+//; s/(\+00:00|Z)$//')" +%s 2>/dev/null
+}
+_usage_suffix=""
+[ -n "$CLAUDE_CONFIG_DIR" ] && _usage_suffix="-${CLAUDE_CONFIG_DIR##*/.claude-}"
+_tmpdir="${TMPDIR:-/tmp}"; _tmpdir="${_tmpdir%/}"
+_usage_cache=${_tmpdir}/claude-usage-cache${_usage_suffix}.json
+_usage_stamp=${_tmpdir}/claude-usage-cache${_usage_suffix}.stamp
+if [ -f "$_usage_cache" ] && [ $(( $(date +%s) - $(stat -f %m "$_usage_cache" 2>/dev/null || echo 0) )) -lt 300 ]; then
+  _crow=$(jq -r '[(.five_hour.utilization // ""), (.five_hour.resets_at // ""), (.seven_day.utilization // ""), (.seven_day.resets_at // "")] | @tsv' "$_usage_cache" 2>/dev/null)
+  IFS=$'\t' read -r _c5u _c5r _c7u _c7r <<< "$_crow"
+  if [ -n "$_c5u" ]; then
+    five_hour_used=$_c5u
+    _e=$(_iso2epoch "$_c5r"); [ -n "$_e" ] && five_hour_resets=$_e
+  fi
+  if [ -n "$_c7u" ]; then
+    seven_day_used=$_c7u
+    _e=$(_iso2epoch "$_c7r"); [ -n "$_e" ] && seven_day_resets=$_e
+  fi
+fi
+
 DIM=$'\033[2m'
 RESET=$'\033[0m'
 SEP="${DIM} | ${RESET}"
@@ -51,6 +78,37 @@ fi
 fields=("${DIM}${model_str}${RESET}" "${DIM}${context_str}${RESET}" "${DIM}${cost_str}${RESET}")
 limit_fields=()
 
+# --- account tag ---
+# Wrapped sessions: tag = CLAUDE_CONFIG_DIR basename minus ".claude-".
+# Bare/backbone sessions: "base <tag>" DERIVED from the logged-in email in
+# ~/.claude.json via ~/.claude/profiles.conf (never assumed), mtime-cached
+# because the file is large; unmapped emails show their local part.
+profile_tag=""
+if [ -n "$CLAUDE_CONFIG_DIR" ]; then
+  profile_tag="${CLAUDE_CONFIG_DIR##*/.claude-}"
+else
+  _cj="$HOME/.claude.json"
+  _conf="$HOME/.claude/profiles.conf"
+  if [ -f "$_cj" ] && [ -f "$_conf" ]; then
+    _bt_cache=${_tmpdir}/claude-backbone-tag.cache
+    _cj_m=$(stat -f %m "$_cj" 2>/dev/null)
+    _bt_line=$(cat "$_bt_cache" 2>/dev/null)
+    if [ -n "$_cj_m" ] && [ "${_bt_line%% *}" = "$_cj_m" ]; then
+      _bt_tag="${_bt_line#* }"
+    else
+      _email=$(jq -r '.oauthAccount.emailAddress // empty' "$_cj" 2>/dev/null)
+      _bt_tag=""
+      if [ -n "$_email" ]; then
+        _bt_tag=$(awk -v e="$_email" '!/^[[:space:]]*#/ && $2==e {print $1; exit}' "$_conf")
+        [ -n "$_bt_tag" ] || _bt_tag="${_email%%@*}"
+      fi
+      echo "$_cj_m $_bt_tag" > "$_bt_cache" 2>/dev/null
+    fi
+    [ -n "$_bt_tag" ] && profile_tag="base $_bt_tag"
+  fi
+fi
+[ -n "$profile_tag" ] && limit_fields+=("${DIM}${profile_tag}${RESET}")
+
 if [ -n "$five_hour_used" ]; then
   five_hour_pct=$(awk -v u="$five_hour_used" 'BEGIN{printf "%.0f", u}')
   five_hour_str="5h: ${five_hour_pct}%"
@@ -72,6 +130,50 @@ if [ -n "$seven_day_used" ]; then
     [ -n "$seven_day_weekday" ] && [ -n "$seven_day_clock" ] && seven_day_str="${seven_day_str} (${seven_day_weekday} ${seven_day_clock})"
   fi
   limit_fields+=("${DIM}${seven_day_str}${RESET}")
+fi
+
+# --- model-scoped weekly buckets ---
+# Some accounts carry per-model weekly limits that the statusline feed does
+# not expose; the usage API's `limits` array does (kind "weekly_scoped").
+# Rendered from the same cache; reset time shown only when it differs from
+# the weekly bucket's, which it normally duplicates.
+_scoped_rows=$(jq -r '(.limits // [])[] | select(.kind=="weekly_scoped" and (.scope.model.display_name // "") != "") | [(.scope.model.display_name | ascii_downcase), .percent, (.resets_at // "")] | @tsv' "$_usage_cache" 2>/dev/null)
+if [ -n "$_scoped_rows" ]; then
+  wk_epoch=$([ -n "$seven_day_resets" ] && awk -v t="$seven_day_resets" 'BEGIN{printf "%.0f", t}' || echo 0)
+  while IFS=$'\t' read -r _sname _spct _sreset; do
+    [ -n "$_sname" ] || continue
+    scoped_str="${_sname}: $(awk -v u="$_spct" 'BEGIN{printf "%.0f", u}')%"
+    _sepoch=$(_iso2epoch "$_sreset")
+    if [ -n "$_sepoch" ] && [ $(( _sepoch > wk_epoch ? _sepoch - wk_epoch : wk_epoch - _sepoch )) -gt 60 ]; then
+      _swd=$(date -r "$_sepoch" '+%a' 2>/dev/null)
+      _sck=$(date -r "$_sepoch" '+%-I%p' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+      [ -n "$_swd" ] && [ -n "$_sck" ] && scoped_str="${scoped_str} (${_swd} ${_sck})"
+    fi
+    limit_fields+=("${DIM}${scoped_str}${RESET}")
+  done <<< "$_scoped_rows"
+fi
+
+# Background refresh of the usage cache, at most every ~2 min, never blocking
+# the render. Reads THIS profile's OAuth token from its keychain slot: with
+# CLAUDE_CONFIG_DIR set, Claude Code stores credentials under the service
+# name "Claude Code-credentials-<first 8 hex of sha256(config dir path)>";
+# the default session uses the unsuffixed name. Note: the usage endpoint is
+# unofficial and may change without notice; the segment degrades to absent.
+_usage_now=$(date +%s)
+_usage_last=$(cat "$_usage_stamp" 2>/dev/null || echo 0)
+if [ $((_usage_now - _usage_last)) -ge 120 ]; then
+  echo "$_usage_now" > "$_usage_stamp" 2>/dev/null
+  (
+    _svc="Claude Code-credentials"
+    [ -n "$CLAUDE_CONFIG_DIR" ] && _svc="${_svc}-$(printf '%s' "$CLAUDE_CONFIG_DIR" | shasum -a 256 | cut -c1-8)"
+    _tok=$(security find-generic-password -s "$_svc" -w 2>/dev/null | jq -r '.claudeAiOauth.accessToken // empty')
+    if [ -n "$_tok" ]; then
+      _resp=$(curl -s --max-time 8 https://api.anthropic.com/api/oauth/usage \
+        -H "Authorization: Bearer $_tok" -H "anthropic-beta: oauth-2025-04-20")
+      printf '%s' "$_resp" | jq -e '.five_hour' >/dev/null 2>&1 && printf '%s' "$_resp" > "$_usage_cache"
+    fi
+  ) &
+  disown 2>/dev/null || true
 fi
 
 # --- git row: state cluster | branch [· worktree] | repo name ---
