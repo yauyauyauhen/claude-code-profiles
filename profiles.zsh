@@ -11,6 +11,9 @@
 #   claude-skip    continue: launches whatever profile is current
 #   claude         (untouched) the backbone itself, permission prompts on
 #
+# /switch <tag> inside a wrapped session carries the LIVE conversation to
+# another account: see ~/.claude/switch-stop-hook.sh and the /switch command
+# (~/.claude/commands/switch.md).
 
 _CLAUDE_PROFILES_CONF="$HOME/.claude/profiles.conf"
 
@@ -72,11 +75,39 @@ _claude_profile_heal() {
   fi
 }
 
-# Launch: self-heal the profile's shared links, then run claude in it.
+# Launch loop. Besides one plain run, this powers /switch: the slash command
+# arms ~/.claude-profiles/switch-request ("<tag> <this shell's pid>"), the
+# Stop hook terminates the idle claude, and this loop relaunches the target
+# profile with -c (same conversation, other account), carrying the dying
+# session's model and effort (hook-stamped lines 2-3 of the request file).
+# Keyed on the request file + pid match only, never on exit codes: SIGTERM
+# exits 143 and that IS the normal switch path.
 _claude_profile_launch() {
   local tag=$1; shift
-  _claude_profile_heal "$tag"
-  CLAUDE_CONFIG_DIR="$HOME/.claude-$tag" command claude "$@"
+  local req=$HOME/.claude-profiles/switch-request rtag rpid rmodel reffort
+  while true; do
+    _claude_profile_heal "$tag"
+    rm -f "$req"
+    CLAUDE_PROFILE_LOOP=$$ CLAUDE_CONFIG_DIR="$HOME/.claude-$tag" command claude "$@"
+    [ -f "$req" ] || break
+    { read -r rtag rpid; read -r rmodel; read -r reffort; } < "$req" 2>/dev/null; rm -f "$req"
+    [ "$rpid" = "$$" ] || break
+    case "$rtag" in
+      (*[!a-zA-Z0-9_-]*|"") echo "claude profiles: malformed switch tag, staying put"; break ;;
+    esac
+    case " $CLAUDE_PROFILES " in
+      *" $rtag "*) ;;
+      *) echo "claude profiles: unknown switch tag '$rtag', staying put"; break ;;
+    esac
+    stty sane 2>/dev/null   # the TUI was SIGTERMed; make sure the terminal is usable
+    echo "$rtag" > "$HOME/.claude-profiles/current"
+    echo "-> switching to $rtag, resuming this conversation${rmodel:+ on $rmodel}"
+    tag=$rtag
+    set -- --dangerously-skip-permissions -c
+    [ -n "$rmodel" ] && set -- "$@" --model "$rmodel"
+    [ -n "$reffort" ] && set -- "$@" --effort "$reffort"
+    rmodel="" reffort=""
+  done
 }
 
 # claude-<tag> = explicit switch (records itself as current, then launches).
