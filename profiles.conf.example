@@ -1,0 +1,13 @@
+# Claude Code account profiles — copy to ~/.claude/profiles.conf and edit.
+#
+# One line per account:  <tag>  <account-email>
+#
+# The tag is the short name used everywhere: the wrapper name (claude-<tag>),
+# the profile directory (~/.claude-<tag>), the statusline chip, and the
+# /switch argument. Keep it short and lowercase.
+#
+# The email is the account each profile is logged into. The statusline uses
+# it to label bare (unwrapped) sessions truthfully by looking at what the
+# default config dir is actually logged in as.
+personal  you@example.com
+work      you@company.com
