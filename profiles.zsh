@@ -146,9 +146,61 @@ _claude_transcript_timefix() {
   echo "transcript timefix: $fixed file(s) backdated to their real last activity"
 }
 
+# Resuming a session mints a NEW session file carrying the history forward;
+# the superseded generation stays behind as a duplicate /resume entry. Archive
+# (never delete) older files whose content is carried by a newer sibling:
+# allowed losses from the picker's view are bookkeeping lines and <=3 dangling
+# unanswered user messages (they remain in the archived file); any missing
+# assistant content, a live-session marker, or recent activity vetoes the move.
+_claude_transcript_dedupe() {
+  setopt local_options null_glob
+  local dir f g id missing mcount bad dangling t archived=0
+  local tmp=$(mktemp -d) archive_root=$HOME/.claude/projects-archive
+  for dir in "$HOME/.claude/projects"/*/; do
+    local files=("${(@f)$(find "$dir" -maxdepth 1 -name '*.jsonl' 2>/dev/null)}")
+    (( ${#files} > 1 )) || continue
+    for f in $files; do jq -r '.uuid // empty' "$f" 2>/dev/null | sort -u > "$tmp/${f:t}.u"; done
+    for f in $files; do
+      [ -f "$f" ] || continue
+      # No reliable liveness signal exists (session-env markers outlive their
+      # sessions; transcripts aren't held open). Archiving an idle-but-open
+      # session is safe anyway: claude appends by path, so at worst it starts
+      # a fresh stub file — never data loss. Guard: skip the last hour.
+      [ -n "$(find "$f" -mmin -60 2>/dev/null)" ] && continue
+      for g in $files; do
+        [ "$f" = "$g" ] && continue
+        [ -f "$g" ] || continue
+        [ "$g" -nt "$f" ] || continue
+        missing=$(comm -23 "$tmp/${f:t}.u" "$tmp/${g:t}.u")
+        mcount=$(printf '%s' "$missing" | grep -c .)
+        (( mcount <= 6 )) || continue
+        bad=0 dangling=0
+        while read -r u; do
+          [ -n "$u" ] || continue
+          t=$(jq -r --arg u "$u" 'select(.uuid==$u) | .type' "$f" 2>/dev/null | head -1)
+          case "$t" in
+            assistant) bad=1 ;;
+            user) dangling=$((dangling+1)) ;;
+          esac
+        done <<< "$missing"
+        (( bad )) && continue
+        (( dangling <= 3 )) || continue
+        mkdir -p "$archive_root/${dir:t}"
+        mv "$f" "$archive_root/${dir:t}/" || continue
+        echo "  archived superseded ${f:t} (history lives in ${g:t}; $dangling dangling user line(s) kept in archive)"
+        archived=$((archived+1))
+        break
+      done
+    done
+  done
+  rm -rf "$tmp"
+  echo "transcript dedupe: $archived superseded generation(s) moved to $archive_root"
+}
+
 claude-doctor() {
   local t
   _claude_transcript_timefix
+  _claude_transcript_dedupe
   for t in $CLAUDE_PROFILES; do
     echo "-- $t --"
     _claude_profile_heal "$t"

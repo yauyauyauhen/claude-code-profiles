@@ -16,7 +16,8 @@ Built for people who legitimately hold several Claude accounts, for example a pe
 claude-work        # switch: launch the "work" profile and remember it as current
 claude-skip        # continue: launch whatever profile is current
 claude             # untouched: the default config dir, permission prompts on
-claude-doctor      # verbose health check: links, marker, transcript timefix
+claude-doctor      # health check: links, marker, transcript timefix,
+                   # and archiving of superseded resume generations
 ```
 
 **`/switch` carries a live conversation to another account.** Inside any wrapped session:
