@@ -67,10 +67,15 @@ echo 'source ~/.claude/profiles.zsh' >> ~/.zshrc
   "hooks": {
     "Stop": [
       { "hooks": [ { "type": "command", "command": "bash ~/.claude/switch-stop-hook.sh" } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "s=\"$HOME/.claude-profiles/tidy.stamp\"; n=$(date +%s); [ $((n - $(cat \"$s\" 2>/dev/null || echo 0))) -lt 3600 ] && exit 0; mkdir -p \"$HOME/.claude-profiles\"; echo $n > \"$s\"; (nohup zsh -c \"source $HOME/.claude/profiles.zsh 2>/dev/null; _claude_transcript_timefix; _claude_transcript_dedupe\" >/dev/null 2>&1 &); exit 0" } ] }
     ]
   }
 }
 ```
+
+The SessionStart entry is the zero-maintenance mode: every session start kicks off the transcript tidy (recency repair plus superseded-generation archiving) in the background, throttled to once an hour and detached, so it never delays a launch. Resume-created duplicates clean themselves up within minutes; you never run anything by hand. Skip that entry if you prefer running `claude-doctor` manually.
 
 4. **Create and log in each profile, one time.** Open a fresh terminal, then for each tag:
 

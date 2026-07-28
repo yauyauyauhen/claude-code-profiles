@@ -165,8 +165,8 @@ _claude_transcript_dedupe() {
       # No reliable liveness signal exists (session-env markers outlive their
       # sessions; transcripts aren't held open). Archiving an idle-but-open
       # session is safe anyway: claude appends by path, so at worst it starts
-      # a fresh stub file — never data loss. Guard: skip the last hour.
-      [ -n "$(find "$f" -mmin -60 2>/dev/null)" ] && continue
+      # a fresh stub file — never data loss. Guard: skip very recent writes.
+      [ -n "$(find "$f" -mmin -10 2>/dev/null)" ] && continue
       for g in $files; do
         [ "$f" = "$g" ] && continue
         [ -f "$g" ] || continue
