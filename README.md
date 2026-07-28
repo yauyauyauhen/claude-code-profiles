@@ -75,7 +75,7 @@ echo 'source ~/.claude/profiles.zsh' >> ~/.zshrc
 }
 ```
 
-The SessionStart entry is the zero-maintenance mode: every session start kicks off the transcript tidy (recency repair plus superseded-generation archiving) in the background, throttled to once an hour and detached, so it never delays a launch. Resume-created duplicates clean themselves up within minutes; you never run anything by hand. Skip that entry if you prefer running `claude-doctor` manually.
+The SessionStart entry is the zero-maintenance mode: every session start kicks off the transcript tidy (recency repair plus superseded-generation archiving) in the background, throttled to once an hour and detached, so it never delays a launch. Resume-created duplicates clean themselves up within minutes; you never run anything by hand. Archived generations are pruned after a year; if you align live-transcript retention, set "cleanupPeriodDays": 365 in the same settings file (Claude Code's own default is around 30 days). Skip that entry if you prefer running `claude-doctor` manually.
 
 4. **Create and log in each profile, one time.** Open a fresh terminal, then for each tag:
 

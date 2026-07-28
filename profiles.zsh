@@ -195,6 +195,13 @@ _claude_transcript_dedupe() {
   done
   rm -rf "$tmp"
   echo "transcript dedupe: $archived superseded generation(s) moved to $archive_root"
+  # Archive retention: archived generations expire after a year, matching the
+  # cleanupPeriodDays=365 policy for live transcripts (mtimes are truthful
+  # end-of-life times — mv preserves them and timefix repairs migration noise).
+  local pruned
+  pruned=$(find "$archive_root" -name '*.jsonl' -mtime +365 -print -delete 2>/dev/null | grep -c .)
+  (( pruned )) && echo "archive retention: deleted $pruned archived transcript(s) older than 365 days"
+  return 0
 }
 
 claude-doctor() {
