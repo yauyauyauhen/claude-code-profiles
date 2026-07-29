@@ -400,6 +400,14 @@ PYSEAT
   return 0
 }
 
+# Manual restore: claim the best orphaned session for THIS directory right
+# now, ignoring the relaunch time-gate — for panes whose shells started too
+# late (or windows recreated by hand) after a terminal restart.
+claude-restore() {
+  CLAUDE_AUTOCLAIM_WINDOW=999999 _claude_session_autoclaim
+  echo "(no session restored: no orphan matches this directory — see ~/.claude-profiles/live/)"
+}
+
 claude-doctor() {
   local t
   _claude_transcript_timefix
