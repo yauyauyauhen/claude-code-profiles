@@ -20,8 +20,6 @@ claude-doctor      # health check: links, marker, transcript timefix,
                    # and archiving of superseded resume generations
 ```
 
-**Sessions survive a terminal restart.** Quit your terminal for an update or a reboot; when it relaunches and restores its window and split layout, every Claude session that died with it comes back on its own — same conversations, resumed by exact session id, on the same account, model, and effort level. A SessionStart hook keeps a registry of live sessions (cwd, account tag, terminal pid, tty), and each restored pane atomically claims one orphan matching its directory. Records are deliberately NOT removed by SessionEnd — that hook fires on terminal quit too and would empty the registry at exactly the wrong moment (learned the hard way). Instead, deletion happens where quit and exit actually differ: when you end a session deliberately, the pane survives and the wrapper cleans its tty's record; when the terminal dies, the wrapper dies with it and the record survives as a restore orphan. A closed-on-purpose session is additionally protected by the terminal-pid rule: only sessions whose terminal process is gone are claimable. Restoration stays armed only for the terminal's first `CLAUDE_AUTOCLAIM_WINDOW` seconds (default 180 — do not set it much tighter: in a staggered multi-window relaunch some panes' shells start tens of seconds in, and panes that miss the window come up as plain shells). For any pane that missed its claim, `claude-restore` claims the best orphan for its directory on demand. With several panes in one directory, seating is restored by tty-order proximity (pane creation order tends to survive a relaunch), so chats usually land back in their original panes; when the order shifts they may swap — the conversations themselves are always exact either way.
-
 **`/switch` carries a live conversation to another account.** Inside any wrapped session:
 
 ```
@@ -57,7 +55,6 @@ Row 1: model, effort, context used, session cost. Row 2: account tag first (so y
 cp profiles.zsh ~/.claude/profiles.zsh
 cp statusline-command.sh ~/.claude/statusline-command.sh
 cp hooks/switch-stop-hook.sh ~/.claude/switch-stop-hook.sh
-cp session-registry.sh ~/.claude/session-registry.sh
 mkdir -p ~/.claude/commands && cp commands/switch.md ~/.claude/commands/switch.md
 echo 'source ~/.claude/profiles.zsh' >> ~/.zshrc
 ```
@@ -86,35 +83,7 @@ echo 'source ~/.claude/profiles.zsh' >> ~/.zshrc
         "hooks": [
           {
             "type": "command",
-            "command": "bash ~/.claude/session-registry.sh start"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
             "command": "s=\"$HOME/.claude-profiles/tidy.stamp\"; n=$(date +%s); [ $((n - $(cat \"$s\" 2>/dev/null || echo 0))) -lt 3600 ] && exit 0; mkdir -p \"$HOME/.claude-profiles\"; echo $n > \"$s\"; (nohup zsh -c \"source $HOME/.claude/profiles.zsh 2>/dev/null; _claude_transcript_timefix; _claude_transcript_dedupe\" >/dev/null 2>&1 &); exit 0"
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ~/.claude/session-registry.sh end"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ~/.claude/session-registry.sh touch"
           }
         ]
       }
@@ -123,7 +92,7 @@ echo 'source ~/.claude/profiles.zsh' >> ~/.zshrc
 }
 ```
 
-The session-registry entries (`SessionStart`/`SessionEnd`/`UserPromptSubmit`) power restore-after-relaunch. The second SessionStart entry is the zero-maintenance mode: every session start kicks off the transcript tidy (recency repair plus superseded-generation archiving) in the background, throttled to once an hour and detached, so it never delays a launch. Resume-created duplicates clean themselves up within minutes; you never run anything by hand. Archived generations are pruned after a year; if you align live-transcript retention, set "cleanupPeriodDays": 365 in the same settings file (Claude Code's own default is around 30 days). Skip that entry if you prefer running `claude-doctor` manually.
+The SessionStart entry is the zero-maintenance mode: every session start kicks off the transcript tidy (recency repair plus superseded-generation archiving) in the background, throttled to once an hour and detached, so it never delays a launch. Resume-created duplicates clean themselves up within minutes; you never run anything by hand. Archived generations are pruned after a year; if you align live-transcript retention, set "cleanupPeriodDays": 365 in the same settings file (Claude Code's own default is around 30 days). Skip that entry if you prefer running `claude-doctor` manually.
 
 4. **Create and log in each profile, one time.** Open a fresh terminal, then for each tag:
 
