@@ -35,11 +35,16 @@ case "$1" in
         (*ghostty*|*Ghostty*|*iTerm*|*Terminal*|*kitty*|*WezTerm*|*Alacritty*) tpid=$pid; break ;;
       esac
     done
-    # a pane owns one session: drop other records on this tty
+    # A pane owns one session — but ONLY within this terminal epoch: tty
+    # numbers recycle across relaunches, and deleting a DEAD epoch's record
+    # on the same tty destroys another pane's still-unclaimed orphan mid-
+    # restore (observed live: early claimers wiped later panes' sessions).
     if [ -n "$tty" ] && [ "$tty" != "-" ] && [ "$tty" != "??" ]; then
       for f in "$dir"/*; do
         [ -f "$f" ] || continue
-        [ "$(sed -n 4p "$f" 2>/dev/null)" = "$tty" ] && [ "$(basename "$f")" != "$id" ] && rm -f "$f"
+        [ "$(basename "$f")" = "$id" ] && continue
+        [ "$(sed -n 4p "$f" 2>/dev/null)" = "$tty" ] || continue
+        [ "$(sed -n 3p "$f" 2>/dev/null)" = "$tpid" ] && rm -f "$f"
       done
     fi
     printf '%s\n%s\n%s\n%s\n' "$cwd" "$tag" "$tpid" "${tty:--}" > "$dir/$id"
