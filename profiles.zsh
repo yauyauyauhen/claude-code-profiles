@@ -259,19 +259,36 @@ _claude_session_autoclaim() {
     *) gsecs=999999 ;;
   esac
   (( gsecs < ${CLAUDE_AUTOCLAIM_WINDOW:-180} )) || return 0
-  local f id rcwd rtag rterm claimed=$HOME/.claude-profiles/claimed
+  local f id rcwd rtag rterm rtty claimed=$HOME/.claude-profiles/claimed
   mkdir -p "$claimed"
-  for f in "$live"/*(Nom); do
-    [ -f "$f" ] || continue
-    [ -n "$(find "$f" -mmin -1440 2>/dev/null)" ] || continue
-    { read -r rcwd; read -r rtag; read -r rterm } < "$f" 2>/dev/null
-    [ "$rcwd" = "$PWD" ] || continue
-    # Terminal still alive => that session was closed on purpose, not lost.
-    # (pid recycling across a relaunch could make a dead terminal's pid match
-    # the new one — treat "same pid as ours" as alive, everything else by
-    # kill -0.)
-    [ "$rterm" = "$tpid" ] && continue
-    [ -n "$rterm" ] && [ "$rterm" != "0" ] && kill -0 "$rterm" 2>/dev/null && continue
+  # Seating heuristic: macOS assigns tty numbers roughly in pane-creation
+  # order and Ghostty recreates panes in a stable order, so relative tty
+  # order tends to survive a relaunch. Claiming the orphan whose OLD tty
+  # number is closest to this pane's NEW one usually restores the original
+  # pane<->chat seating. (Exact seating is impossible: Ghostty answers no
+  # title queries, so a pane can never read its own restored marker.)
+  local mytty best bestd rnum d
+  mytty=$(tty 2>/dev/null); mytty=${mytty//[^0-9]/}; [ -n "$mytty" ] || mytty=0
+  while true; do
+    best=""; bestd=999999
+    for f in "$live"/*(N); do
+      [ -f "$f" ] || continue
+      [ -n "$(find "$f" -mmin -1440 2>/dev/null)" ] || continue
+      { read -r rcwd; read -r rtag; read -r rterm; read -r rtty } < "$f" 2>/dev/null
+      [ "$rcwd" = "$PWD" ] || continue
+      # Terminal still alive => that session was closed on purpose, not lost.
+      # (pid recycling across a relaunch could make a dead terminal's pid
+      # match the new one — treat "same pid as ours" as alive, everything
+      # else by kill -0.)
+      [ "$rterm" = "$tpid" ] && continue
+      [ -n "$rterm" ] && [ "$rterm" != "0" ] && kill -0 "$rterm" 2>/dev/null && continue
+      rnum=${rtty//[^0-9]/}; [ -n "$rnum" ] || rnum=99999
+      d=$(( rnum > mytty ? rnum - mytty : mytty - rnum ))
+      (( d < bestd )) && { bestd=$d; best=$f; }
+    done
+    [ -n "$best" ] || return 0
+    f=$best
+    { read -r rcwd; read -r rtag; read -r rterm; read -r rtty } < "$f" 2>/dev/null
     id=${f:t}
     local -a tr
     tr=( "$HOME"/.claude/projects/*/"$id".jsonl(N) )
