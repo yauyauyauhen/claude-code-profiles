@@ -280,19 +280,38 @@ _claude_session_autoclaim() {
     # No nonce needed: the login banner above us already shows our tty
     # visibly ("Last login: ... on ttysNNN"), and that DOES survive into AX
     # text (zero-width nonces don't — Ghostty strips them from text).
-    local loc oldtty
-    loc=$(printf '{"cmd":"seat-locate","tty":%d}\n' "$((10#$mytty))" | nc -U "$sock" -w 3 2>/dev/null)
+    # Retry the locate: at T+0 of a relaunch, windows and pane text may not
+    # be AX-visible yet.
+    local loc oldtty _try
+    for _try in 1 2 3 4; do
+      loc=$(printf '{"cmd":"seat-locate","tty":%d}\n' "$((10#$mytty))" | nc -U "$sock" -w 3 2>/dev/null)
+      printf '%s' "$loc" | grep -q '"ok":true' && break
+      sleep 0.8
+    done
     if printf '%s' "$loc" | grep -q '"ok":true'; then
-      oldtty=$(python3 - "$seatjson" "$loc" "$((10#$mytty))" <<'PYSEAT'
-import json, sys
-table = json.load(open(sys.argv[1])); loc = json.loads(sys.argv[2]); me = sys.argv[3]
-best = None
-for tty, e in table.items():
-    if tty == me: continue
-    if e.get("p") != loc.get("p"): continue
+      # Match our slot against the table. Entries are epoch-keyed
+      # ("<terminal-pid>:<tty>"): only DEAD epochs are eligible (a live
+      # epoch's entries describe current panes, incl. recycled tty numbers).
+      # Frame match first; split path breaks ties among siblings.
+      oldtty=$(python3 - "$seatjson" "$loc" "$tpid" <<'PYSEAT'
+import json, sys, os
+table = json.load(open(sys.argv[1])); loc = json.loads(sys.argv[2]); mytpid = int(sys.argv[3])
+def alive(pid):
+    try: os.kill(pid, 0); return True
+    except Exception: return False
+cands = []
+for key, e in table.items():
+    if ":" not in key: continue
+    epoch, tty = key.split(":", 1)
+    epoch = int(epoch)
+    if epoch == mytpid or alive(epoch): continue
     if all(abs(e[k] - loc[k]) <= 8 for k in ("x", "y", "w", "h")):
-        if best is None or e["seen"] > table[best]["seen"]: best = tty
-print(best or "")
+        cands.append((tty, e))
+if len(cands) > 1:
+    exact = [c for c in cands if c[1].get("p") == loc.get("p")]
+    if exact: cands = exact
+cands.sort(key=lambda c: c[1].get("seen", 0), reverse=True)
+print(cands[0][0] if cands else "")
 PYSEAT
 )
       if [ -n "$oldtty" ]; then
@@ -317,6 +336,7 @@ PYSEAT
             [ -n "$model" ] && args+=(--model "$model")
             [ -n "$effort" ] && args+=(--effort "$effort")
             echo "→ restoring session ${id:0:8}… to its exact pane (${rtag}${model:+ · $model})"
+            echo "$(date '+%m-%d %H:%M') seat  tty=$mytty old=$oldtty $id" >> "$HOME/.claude-profiles/restore.log"
             if [ -n "$CLAUDE_AUTOCLAIM_DRYRUN" ]; then
               echo "DRYRUN(seat) tag=$rtag args: ${args[*]}"; return 0
             fi
@@ -365,6 +385,7 @@ PYSEAT
     [ -n "$model" ] && args+=(--model "$model")
     [ -n "$effort" ] && args+=(--effort "$effort")
     echo "→ restoring session ${id:0:8}… (${rtag}${model:+ · $model}${effort:+ · $effort})"
+    echo "$(date '+%m-%d %H:%M') prox  tty=$mytty dist=$bestd $id" >> "$HOME/.claude-profiles/restore.log"
     if [ -n "$CLAUDE_AUTOCLAIM_DRYRUN" ]; then
       echo "DRYRUN tag=$rtag args: ${args[*]}"
       return 0
