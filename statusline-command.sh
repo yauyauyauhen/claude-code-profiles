@@ -75,6 +75,33 @@ if [ -n "$effort_level" ]; then
   model_str="${model_str} · ${effort_level}"
 fi
 
+# Assert this pane's marked window title on every render, written straight to
+# the tty device: folder name + an INVISIBLE zero-width tty marker. This is
+# the marker channel for exact session restore (see profiles.zsh) and for
+# agent-notify's window targeting. Doing it in the statusline (not the shell)
+# covers EVERY claude pane regardless of launcher, and Ghostty preserves
+# zero-width chars in titles though it strips them from on-screen text.
+# Encoding: U+2060, 12 bits U+200B(0)/U+200C(1) MSB-first, U+2060.
+if [ "$TERM_PROGRAM" = "ghostty" ] && [ -n "$current_dir" ]; then
+  _ppid=$PPID _ptty=""
+  for _hop in 1 2 3; do
+    _ptty=$(ps -o tty= -p "$_ppid" 2>/dev/null | tr -d ' ')
+    [ -n "$_ptty" ] && [ "$_ptty" != "??" ] && break
+    _ppid=$(ps -o ppid= -p "$_ppid" 2>/dev/null | tr -d ' ')
+    [ -n "$_ppid" ] || break
+  done
+  _pnum=${_ptty//[^0-9]/}; [ "$_ptty" = "??" ] && _pnum=""
+  if [ -n "$_pnum" ] && [ -w "/dev/$_ptty" ]; then
+    _ZB=$'\xe2\x80\x8b' _ZC=$'\xe2\x80\x8c' _ZJ=$'\xe2\x81\xa0'
+    _pnum=$((10#$_pnum)); _tmark=$_ZJ
+    for _i in 11 10 9 8 7 6 5 4 3 2 1 0; do
+      if [ $(( (_pnum >> _i) & 1 )) -eq 1 ]; then _tmark+=$_ZC; else _tmark+=$_ZB; fi
+    done
+    _tmark+=$_ZJ
+    printf '\033]2;%s%s\007' "${current_dir##*/}" "$_tmark" > "/dev/$_ptty" 2>/dev/null
+  fi
+fi
+
 fields=("${DIM}${model_str}${RESET}" "${DIM}${context_str}${RESET}" "${DIM}${cost_str}${RESET}")
 limit_fields=()
 
