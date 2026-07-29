@@ -204,10 +204,91 @@ _claude_transcript_dedupe() {
   return 0
 }
 
+# --- session restore: auto-claim orphaned sessions after a terminal relaunch ---
+# SessionStart/End hooks maintain ~/.claude-profiles/live/<session-id> records
+# (cwd, tag, terminal pid; UserPromptSubmit refreshes mtime). When the terminal
+# relaunches and restores its window/split layout, each fresh shell claims one
+# orphan matching its cwd ATOMICALLY (mv into claimed/) and resumes it by exact
+# session id, carrying the dying session's model and effort.
+#
+# The safety rule is the recorded TERMINAL PID: only sessions whose terminal
+# process is gone are claimable. A window closed deliberately while the
+# terminal keeps running can never be resurrected — which makes the design
+# correct whether or not SessionEnd fires on window close (untested; the
+# hook's own record is the belt, this is the suspenders).
+# Further guards: only in the terminal's first CLAUDE_AUTOCLAIM_WINDOW seconds
+# (default 180) so deliberate new tabs later never trigger it, records fresher
+# than 24h, transcript must still exist, and one session per pane.
+# Same-directory panes may swap which chat lands where; content is always
+# exact. Launches through the wrappers WITHOUT touching the claude-skip
+# marker: restoration is not an account switch.
+_claude_session_autoclaim() {
+  setopt local_options null_glob
+  local live=$HOME/.claude-profiles/live
+  [ -d "$live" ] || return 0
+  # This pane's own terminal: walk up to the terminal app process.
+  local pid=$$ comm tpid=0
+  for _ in 1 2 3 4 5 6 7 8; do
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -n "$pid" ] && [ "$pid" != "1" ] || break
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null)
+    case "$comm" in
+      (*ghostty*|*Ghostty*|*iTerm*|*Terminal*|*kitty*|*WezTerm*|*Alacritty*) tpid=$pid; break ;;
+    esac
+  done
+  (( tpid )) || return 0
+  local gsecs gstart
+  gstart=$(ps -o etime= -p "$tpid" 2>/dev/null | tr -d ' ')
+  local -a _gp
+  _gp=(${(s.:.)${gstart//-/:}})
+  case ${#_gp} in
+    1) gsecs=${_gp[1]} ;;
+    2) gsecs=$(( ${_gp[1]#0}*60 + ${_gp[2]#0} )) ;;
+    *) gsecs=999999 ;;
+  esac
+  (( gsecs < ${CLAUDE_AUTOCLAIM_WINDOW:-180} )) || return 0
+  local f id rcwd rtag rterm claimed=$HOME/.claude-profiles/claimed
+  mkdir -p "$claimed"
+  for f in "$live"/*(Nom); do
+    [ -f "$f" ] || continue
+    [ -n "$(find "$f" -mmin -1440 2>/dev/null)" ] || continue
+    { read -r rcwd; read -r rtag; read -r rterm } < "$f" 2>/dev/null
+    [ "$rcwd" = "$PWD" ] || continue
+    # Terminal still alive => that session was closed on purpose, not lost.
+    [ "$rterm" = "$tpid" ] && continue
+    [ -n "$rterm" ] && [ "$rterm" != "0" ] && kill -0 "$rterm" 2>/dev/null && continue
+    id=${f:t}
+    local -a tr
+    tr=( "$HOME"/.claude/projects/*/"$id".jsonl(N) )
+    (( ${#tr} )) || { rm -f "$f"; continue; }
+    mv "$f" "$claimed/$id" 2>/dev/null || continue
+    local model effort
+    model=$(tail -n 200 "${tr[1]}" | jq -r '.message.model // empty' 2>/dev/null | grep '^claude-' | tail -1)
+    effort=$(tail -n 200 "${tr[1]}" | jq -r 'select(.type=="assistant") | .effort // empty' 2>/dev/null | grep -E '^(low|medium|high|xhigh|max)$' | tail -1)
+    local -a args
+    args=(--dangerously-skip-permissions --resume "$id")
+    [ -n "$model" ] && args+=(--model "$model")
+    [ -n "$effort" ] && args+=(--effort "$effort")
+    echo "→ restoring session ${id:0:8}… (${rtag}${model:+ · $model}${effort:+ · $effort})"
+    if [ -n "$CLAUDE_AUTOCLAIM_DRYRUN" ]; then
+      echo "DRYRUN tag=$rtag args: ${args[*]}"
+      return 0
+    fi
+    if [ "$rtag" = "base" ]; then
+      command claude "${args[@]}"
+    else
+      _claude_profile_launch "$rtag" "${args[@]}"
+    fi
+    return 0
+  done
+  return 0
+}
+
 claude-doctor() {
   local t
   _claude_transcript_timefix
   _claude_transcript_dedupe
+  find "$HOME/.claude-profiles/claimed" -type f -mtime +7 -delete 2>/dev/null
   for t in $CLAUDE_PROFILES; do
     echo "-- $t --"
     _claude_profile_heal "$t"
