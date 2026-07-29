@@ -269,6 +269,69 @@ _claude_session_autoclaim() {
   # title queries, so a pane can never read its own restored marker.)
   local mytty best bestd rnum d
   mytty=$(tty 2>/dev/null); mytty=${mytty//[^0-9]/}; [ -n "$mytty" ] || mytty=0
+  # --- exact seat first: nonce + daemon + seating table -------------------
+  # Print our tty marker onto our own screen, ask the agent-notify daemon
+  # which window/split slot shows it, and look up who lived in that slot
+  # before the relaunch (the daemon's continuous sampler records every
+  # pane's marker + slot into seating.json). Falls through to the proximity
+  # heuristic when any link is missing.
+  local seatjson=$HOME/.claude-profiles/seating.json sock=$HOME/.claude/ccnotify/notifyd.sock
+  if [ -S "$sock" ] && [ -f "$seatjson" ] && [ "$mytty" != 0 ]; then
+    # No nonce needed: the login banner above us already shows our tty
+    # visibly ("Last login: ... on ttysNNN"), and that DOES survive into AX
+    # text (zero-width nonces don't — Ghostty strips them from text).
+    local loc oldtty
+    loc=$(printf '{"cmd":"seat-locate","tty":%d}\n' "$((10#$mytty))" | nc -U "$sock" -w 3 2>/dev/null)
+    if printf '%s' "$loc" | grep -q '"ok":true'; then
+      oldtty=$(python3 - "$seatjson" "$loc" "$((10#$mytty))" <<'PYSEAT'
+import json, sys
+table = json.load(open(sys.argv[1])); loc = json.loads(sys.argv[2]); me = sys.argv[3]
+best = None
+for tty, e in table.items():
+    if tty == me: continue
+    if e.get("p") != loc.get("p"): continue
+    if all(abs(e[k] - loc[k]) <= 8 for k in ("x", "y", "w", "h")):
+        if best is None or e["seen"] > table[best]["seen"]: best = tty
+print(best or "")
+PYSEAT
+)
+      if [ -n "$oldtty" ]; then
+        local rf rtty4
+        for rf in "$live"/*(N); do
+          rtty4=$(sed -n 4p "$rf" 2>/dev/null); rtty4=${rtty4//[^0-9]/}
+          [ -n "$rtty4" ] && [ "$((10#$rtty4))" = "$oldtty" ] || continue
+          { read -r rcwd; read -r rtag; read -r rterm } < "$rf" 2>/dev/null
+          [ "$rcwd" = "$PWD" ] || continue
+          [ -n "$rterm" ] && [ "$rterm" != "0" ] && kill -0 "$rterm" 2>/dev/null && continue
+          local id=${rf:t}
+          local -a tr
+          tr=( "$HOME"/.claude/projects/*/"$id".jsonl(N) )
+          (( ${#tr} )) || { rm -f "$rf"; continue; }
+          mkdir -p "$HOME/.claude-profiles/claimed" 2>/dev/null
+          if mv "$rf" "$HOME/.claude-profiles/claimed/$id" 2>/dev/null; then
+            local model effort
+            model=$(tail -n 200 "${tr[1]}" | jq -r '.message.model // empty' 2>/dev/null | grep '^claude-' | tail -1)
+            effort=$(tail -n 200 "${tr[1]}" | jq -r 'select(.type=="assistant") | .effort // empty' 2>/dev/null | grep -E '^(low|medium|high|xhigh|max)$' | tail -1)
+            local -a args
+            args=(--dangerously-skip-permissions --resume "$id")
+            [ -n "$model" ] && args+=(--model "$model")
+            [ -n "$effort" ] && args+=(--effort "$effort")
+            echo "→ restoring session ${id:0:8}… to its exact pane (${rtag}${model:+ · $model})"
+            if [ -n "$CLAUDE_AUTOCLAIM_DRYRUN" ]; then
+              echo "DRYRUN(seat) tag=$rtag args: ${args[*]}"; return 0
+            fi
+            if [ "$rtag" = "base" ]; then
+              command claude "${args[@]}"
+            else
+              _claude_profile_launch "$rtag" "${args[@]}"
+            fi
+            return 0
+          fi
+        done
+      fi
+    fi
+  fi
+  # --- fallback: tty-order proximity --------------------------------------
   while true; do
     best=""; bestd=999999
     for f in "$live"/*(N); do
