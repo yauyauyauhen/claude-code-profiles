@@ -108,6 +108,18 @@ _claude_profile_launch() {
     [ -n "$reffort" ] && set -- "$@" --effort "$reffort"
     rmodel="" reffort=""
   done
+  # Reaching here = claude exited and the PANE SURVIVED, i.e. a deliberate
+  # exit — clean this tty's registry records so the session is never
+  # "restored" later. On a terminal quit the shell dies inside the loop
+  # above and this never runs: those records survive as restore orphans.
+  # (SessionEnd can't do this job — it fires on quits too.)
+  local _rt=$(tty 2>/dev/null); _rt=${_rt##*/dev/}
+  if [ -n "$_rt" ]; then
+    local _rf
+    for _rf in "$HOME/.claude-profiles/live"/*(N); do
+      [ "$(sed -n 4p "$_rf" 2>/dev/null)" = "$_rt" ] && rm -f "$_rf"
+    done
+  fi
 }
 
 # claude-<tag> = explicit switch (records itself as current, then launches).
@@ -255,6 +267,9 @@ _claude_session_autoclaim() {
     { read -r rcwd; read -r rtag; read -r rterm } < "$f" 2>/dev/null
     [ "$rcwd" = "$PWD" ] || continue
     # Terminal still alive => that session was closed on purpose, not lost.
+    # (pid recycling across a relaunch could make a dead terminal's pid match
+    # the new one — treat "same pid as ours" as alive, everything else by
+    # kill -0.)
     [ "$rterm" = "$tpid" ] && continue
     [ -n "$rterm" ] && [ "$rterm" != "0" ] && kill -0 "$rterm" 2>/dev/null && continue
     id=${f:t}
@@ -289,6 +304,7 @@ claude-doctor() {
   _claude_transcript_timefix
   _claude_transcript_dedupe
   find "$HOME/.claude-profiles/claimed" -type f -mtime +7 -delete 2>/dev/null
+  find "$HOME/.claude-profiles/live" -type f -mmin +1440 -delete 2>/dev/null
   for t in $CLAUDE_PROFILES; do
     echo "-- $t --"
     _claude_profile_heal "$t"
