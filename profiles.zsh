@@ -404,8 +404,15 @@ PYSEAT
 # now, ignoring the relaunch time-gate — for panes whose shells started too
 # late (or windows recreated by hand) after a terminal restart.
 claude-restore() {
+  local _found="" _f
+  for _f in "$HOME/.claude-profiles/live"/*(N); do
+    [ "$(sed -n 1p "$_f" 2>/dev/null)" = "$PWD" ] && { _found=1; break; }
+  done
+  if [ -z "$_found" ]; then
+    echo "claude-restore: no orphaned session for this directory (see ~/.claude-profiles/live/)"
+    return 1
+  fi
   CLAUDE_AUTOCLAIM_WINDOW=999999 _claude_session_autoclaim
-  echo "(no session restored: no orphan matches this directory — see ~/.claude-profiles/live/)"
 }
 
 claude-doctor() {
