@@ -115,9 +115,14 @@ _claude_profile_launch() {
   # (SessionEnd can't do this job — it fires on quits too.)
   local _rt=$(tty 2>/dev/null); _rt=${_rt##*/dev/}
   if [ -n "$_rt" ]; then
-    local _rf
+    # Epoch-scoped: only records whose terminal is STILL ALIVE (this epoch).
+    # tty numbers recycle across relaunches — deleting a dead epoch's record
+    # on a recycled tty destroys another pane's unclaimed orphan.
+    local _rf _rterm
     for _rf in "$HOME/.claude-profiles/live"/*(N); do
-      [ "$(sed -n 4p "$_rf" 2>/dev/null)" = "$_rt" ] && rm -f "$_rf"
+      [ "$(sed -n 4p "$_rf" 2>/dev/null)" = "$_rt" ] || continue
+      _rterm=$(sed -n 3p "$_rf" 2>/dev/null)
+      [ -n "$_rterm" ] && [ "$_rterm" != "0" ] && kill -0 "$_rterm" 2>/dev/null && rm -f "$_rf"
     done
   fi
 }
@@ -268,7 +273,10 @@ _claude_session_autoclaim() {
   # pane<->chat seating. (Exact seating is impossible: Ghostty answers no
   # title queries, so a pane can never read its own restored marker.)
   local mytty best bestd rnum d
-  mytty=$(tty 2>/dev/null); mytty=${mytty//[^0-9]/}; [ -n "$mytty" ] || mytty=0
+  mytty=$(tty 2>/dev/null); mytty=${mytty//[^0-9]/}
+  # A shell with no tty (Superset ptys etc.) cannot know which pane it is —
+  # claiming from it grabs an essentially random session. Never do that.
+  [ -n "$mytty" ] || return 0
   # --- exact seat first: nonce + daemon + seating table -------------------
   # Print our tty marker onto our own screen, ask the agent-notify daemon
   # which window/split slot shows it, and look up who lived in that slot
