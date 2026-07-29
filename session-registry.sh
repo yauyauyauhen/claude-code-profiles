@@ -19,7 +19,7 @@ id=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
 [ -n "$id" ] || exit 0
 
 case "$1" in
-  start)
+  start|touch)
     mkdir -p "$dir"
     cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
     tag=base
@@ -53,9 +53,6 @@ case "$1" in
     # No deletion (see header). Log the reason payload once per end so we can
     # later learn whether quits are distinguishable from exits after all.
     printf '%s %s\n' "$(date '+%m-%d %H:%M')" "$(printf '%s' "$input" | jq -c '{reason, session_id}' 2>/dev/null)" >> "$HOME/.claude-profiles/end-reasons.log"
-    ;;
-  touch)
-    [ -f "$dir/$id" ] && touch "$dir/$id"
     ;;
 esac
 exit 0
