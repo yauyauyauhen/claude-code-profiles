@@ -75,22 +75,26 @@ _claude_profile_heal() {
   fi
 }
 
-# Launch loop. Besides one plain run, this powers /switch: the slash command
-# arms ~/.claude-profiles/switch-request ("<tag> <this shell's pid>"), the
-# Stop hook terminates the idle claude, and this loop relaunches the target
-# profile with -c (same conversation, other account), carrying the dying
-# session's model and effort (hook-stamped lines 2-3 of the request file).
+# Launch loop. Besides one plain run, this powers /switch: the command (or the
+# quota-proof prompt hook) arms ~/.claude-profiles/switch-request ("<tag>
+# <this shell's pid>"), a hook terminates the idle claude, and this loop
+# relaunches the target profile in the session's own directory with
+# --resume <session-id> (hook-stamped; -c fallback): same conversation, other
+# account, even when the session moved into a git worktree mid-conversation.
 # Keyed on the request file + pid match only, never on exit codes: SIGTERM
 # exits 143 and that IS the normal switch path.
 _claude_profile_launch() {
   local tag=$1; shift
-  local req=$HOME/.claude-profiles/switch-request rtag rpid rmodel reffort
+  local req=$HOME/.claude-profiles/switch-request rtag rpid rmodel reffort rcwd rsid
+  local origdir=$PWD
+  {
   while true; do
     _claude_profile_heal "$tag"
     rm -f "$req"
     CLAUDE_PROFILE_LOOP=$$ CLAUDE_CONFIG_DIR="$HOME/.claude-$tag" command claude "$@"
     [ -f "$req" ] || break
-    { read -r rtag rpid; read -r rmodel; read -r reffort; } < "$req" 2>/dev/null; rm -f "$req"
+    # Lines 2-5 are read with IFS= so a path's leading/trailing spaces survive.
+    { read -r rtag rpid; IFS= read -r rmodel; IFS= read -r reffort; IFS= read -r rcwd; IFS= read -r rsid; } < "$req" 2>/dev/null; rm -f "$req"
     [ "$rpid" = "$$" ] || break
     case "$rtag" in
       (*[!a-zA-Z0-9_-]*|"") echo "claude profiles: malformed switch tag, staying put"; break ;;
@@ -103,11 +107,35 @@ _claude_profile_launch() {
     echo "$rtag" > "$HOME/.claude-profiles/current"
     echo "-> switching to $rtag, resuming this conversation${rmodel:+ on $rmodel}"
     tag=$rtag
-    set -- --dangerously-skip-permissions -c
+    # Relaunch WHERE the conversation actually lives: the hook stamps line 4
+    # (the ancestor of the session's cwd whose project slug owns the
+    # transcript; entering a worktree mid-conversation re-homes it away from
+    # the launch dir) + line 5 (session id) as a validated PAIR, or neither.
+    # cd + --resume succeed or fail TOGETHER: `--resume <id>` hard-fails from
+    # a dir that doesn't own the transcript. Every degraded path returns to
+    # the LAUNCH dir for `-c` and says so out loud: the current cwd may be a
+    # PRIOR switch's worktree, and a silent `-c` in a history-less dir starts
+    # a fresh blank conversation with exit 0.
+    if [ -n "$rcwd" ] && [ -n "$rsid" ] && cd -- "$rcwd" 2>/dev/null; then
+      set -- --dangerously-skip-permissions --resume "$rsid"
+    else
+      echo "claude profiles: no validated session pair${rcwd:+ (dir $rcwd unavailable)}, resuming most-recent in $origdir"
+      cd -- "$origdir" 2>/dev/null
+      set -- --dangerously-skip-permissions -c
+    fi
+    # Carry the dying session's exact model + effort (hook-stamped lines 2-3):
+    # the saved defaults in settings.json may be something else entirely.
     [ -n "$rmodel" ] && set -- "$@" --model "$rmodel"
     [ -n "$reffort" ] && set -- "$@" --effort "$reffort"
-    rmodel="" reffort=""
+    rmodel="" reffort="" rcwd="" rsid=""
   done
+  } always {
+    # A switch may have cd'd us into another directory; restore even on abort.
+    # (zsh `always` runs for interactive shells incl. SIGINT; under
+    # non-interactive zsh SIGINT can skip it — fine while this file is only
+    # ever sourced into interactive shells.)
+    cd -- "$origdir" 2>/dev/null || cd ~
+  }
 }
 
 # claude-<tag> = explicit switch (records itself as current, then launches).
