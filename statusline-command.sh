@@ -1,7 +1,7 @@
 #!/bin/bash
 # Claude Code statusline: three dim rows.
-#   1  model · effort | ctx used | session cost
-#   2  account tag | 5h usage | weekly usage | model-scoped weekly buckets
+#   1  model · effort | ctx used | prompt-cache warmth | session cost
+#   2  account tag | 5h usage | weekly buckets (session model's bucket first)
 #   3  [dirty/unpushed/unmerged] | branch [· worktree] | repo   (or bare path)
 # Every segment hides when it has nothing to say; a clean synced repo on a
 # default session renders just "⎇ main | myrepo".
@@ -20,6 +20,7 @@ seven_day_used=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage /
 five_hour_resets=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
 seven_day_resets=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
 current_dir=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // empty')
+transcript_path=$(echo "$input" | jq -r '.transcript_path // empty')
 
 # --- shared per-account usage cache ---
 # The background usage poll (below) stores the full usage-API response per
@@ -65,6 +66,37 @@ else
   cost_str='$0.00'
 fi
 
+# --- prompt-cache warmth ---
+# The server-side prompt cache for this conversation expires 1h after the
+# last request (the subscription TTL). Warm renders as "3:19am · warm"
+# (cached until then; the next message re-reads history at a fraction of the
+# cost); expired renders as "cold" (the next message re-ingests the full
+# history — also the cheap moment to /compact). Approximate on purpose:
+# overage can drop the TTL, and a CLI update or CLAUDE.md edit can miss a
+# live entry; neither is knowable from here. No transcript yet -> absent.
+cache_str=""
+if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+  # File mtime is NOT the anchor: resuming a session appends meta lines
+  # (file-history snapshots, summaries) with no API request, which would show
+  # a re-warmed cache that doesn't exist. Anchor to the last assistant
+  # entry's own timestamp, written exactly when a response landed = cache
+  # written. grep+tail keeps it O(tail) cheap on huge transcripts; mtime is
+  # the fallback.
+  _last_req_iso=$(tail -c 2000000 "$transcript_path" 2>/dev/null | grep '"type":"assistant"' | tail -1 | jq -r '.timestamp // empty' 2>/dev/null)
+  _t_mtime=""
+  [ -n "$_last_req_iso" ] && _t_mtime=$(_iso2epoch "$_last_req_iso")
+  [ -n "$_t_mtime" ] || _t_mtime=$(stat -f %m "$transcript_path" 2>/dev/null || echo 0)
+  if [ "$_t_mtime" -gt 0 ]; then
+    _cache_exp=$((_t_mtime + 3600))
+    if [ "$(date +%s)" -lt "$_cache_exp" ]; then
+      _exp_time=$(date -r "$_cache_exp" '+%-I:%M%p' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+      cache_str="${_exp_time:+${_exp_time} · }warm"
+    else
+      cache_str="cold"
+    fi
+  fi
+fi
+
 # Strip a trailing parenthetical mentioning "context", e.g. " (1M context)".
 model=$(printf '%s' "$model" | sed -E 's/[[:space:]]*\([^()]*[Cc][Oo][Nn][Tt][Ee][Xx][Tt][^()]*\)[[:space:]]*$//')
 model=$(printf '%s' "$model" | sed -E 's/[[:space:]]+[0-9]+[A-Za-z]*([[:space:]]+[Mm][Ii][Ll][Ll][Ii][Oo][Nn])?[[:space:]]+[Cc][Oo][Nn][Tt][Ee][Xx][Tt][[:space:]]*$//')
@@ -102,7 +134,9 @@ if [ "$TERM_PROGRAM" = "ghostty" ] && [ -n "$current_dir" ]; then
   fi
 fi
 
-fields=("${DIM}${model_str}${RESET}" "${DIM}${context_str}${RESET}" "${DIM}${cost_str}${RESET}")
+fields=("${DIM}${model_str}${RESET}" "${DIM}${context_str}${RESET}")
+[ -n "$cache_str" ] && fields+=("${DIM}${cache_str}${RESET}")
+fields+=("${DIM}${cost_str}${RESET}")
 limit_fields=()
 
 # --- account tag ---
@@ -136,48 +170,104 @@ else
 fi
 [ -n "$profile_tag" ] && limit_fields+=("${DIM}${profile_tag}${RESET}")
 
+# Reset clocks ceil to the next half-hour: a clock may read late, never
+# early, so checking at the shown time always finds the window reset.
+_ceil30() { echo $(( ($1 + 1799) / 1800 * 1800 )); }
+_clock() { date -r "$1" '+%-I:%M%p' 2>/dev/null | tr '[:upper:]' '[:lower:]' | sed 's/:00//'; }
+
 if [ -n "$five_hour_used" ]; then
   five_hour_pct=$(awk -v u="$five_hour_used" 'BEGIN{printf "%.0f", u}')
   five_hour_str="5h: ${five_hour_pct}%"
   if [ -n "$five_hour_resets" ]; then
     five_hour_epoch=$(awk -v t="$five_hour_resets" 'BEGIN{printf "%.0f", t}')
-    five_hour_time=$(date -r "$five_hour_epoch" '+%-I:%M%p' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    five_hour_time=$(_clock "$(_ceil30 "$five_hour_epoch")")
     [ -n "$five_hour_time" ] && five_hour_str="${five_hour_str} (${five_hour_time})"
   fi
   limit_fields+=("${DIM}${five_hour_str}${RESET}")
 fi
 
+# The weekly buckets (wk + any model-scoped ones) are built as pct string +
+# detached reset part first, appended in a model-dependent order below; the
+# append step decides which reset clock actually renders.
+seven_day_str="" seven_day_ceil=0 seven_day_reset=""
 if [ -n "$seven_day_used" ]; then
   seven_day_pct=$(awk -v u="$seven_day_used" 'BEGIN{printf "%.0f", u}')
   seven_day_str="wk: ${seven_day_pct}%"
   if [ -n "$seven_day_resets" ]; then
     seven_day_epoch=$(awk -v t="$seven_day_resets" 'BEGIN{printf "%.0f", t}')
-    seven_day_weekday=$(date -r "$seven_day_epoch" '+%a' 2>/dev/null)
-    seven_day_clock=$(date -r "$seven_day_epoch" '+%-I%p' 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    [ -n "$seven_day_weekday" ] && [ -n "$seven_day_clock" ] && seven_day_str="${seven_day_str} (${seven_day_weekday} ${seven_day_clock})"
+    seven_day_ceil=$(_ceil30 "$seven_day_epoch")
+    seven_day_weekday=$(date -r "$seven_day_ceil" '+%a' 2>/dev/null)
+    seven_day_clock=$(_clock "$seven_day_ceil")
+    [ -n "$seven_day_weekday" ] && [ -n "$seven_day_clock" ] && seven_day_reset=" (${seven_day_weekday} ${seven_day_clock})"
   fi
-  limit_fields+=("${DIM}${seven_day_str}${RESET}")
 fi
 
 # --- model-scoped weekly buckets ---
 # Some accounts carry per-model weekly limits that the statusline feed does
 # not expose; the usage API's `limits` array does (kind "weekly_scoped").
-# Rendered from the same cache; reset time shown only when it differs from
-# the weekly bucket's, which it normally duplicates.
+# Rendered from the same cache. A bucket whose cached reset has already
+# passed is HIDDEN rather than shown: the poll only writes on success
+# (expired token / offline leaves the file in place), so that pct belongs to
+# a dead window; the next successful poll restores the bucket.
 _scoped_rows=$(jq -r '(.limits // [])[] | select(.kind=="weekly_scoped" and (.scope.model.display_name // "") != "") | [(.scope.model.display_name | ascii_downcase), .percent, (.resets_at // "")] | @tsv' "$_usage_cache" 2>/dev/null)
+scoped_strs=() scoped_ceils=() scoped_resets=()
+scoped_session_idx=""
+_model_lc=$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')
+_now_epoch=$(date +%s)
 if [ -n "$_scoped_rows" ]; then
-  wk_epoch=$([ -n "$seven_day_resets" ] && awk -v t="$seven_day_resets" 'BEGIN{printf "%.0f", t}' || echo 0)
   while IFS=$'\t' read -r _sname _spct _sreset; do
     [ -n "$_sname" ] || continue
-    scoped_str="${_sname}: $(awk -v u="$_spct" 'BEGIN{printf "%.0f", u}')%"
     _sepoch=$(_iso2epoch "$_sreset")
-    if [ -n "$_sepoch" ] && [ $(( _sepoch > wk_epoch ? _sepoch - wk_epoch : wk_epoch - _sepoch )) -gt 60 ]; then
-      _swd=$(date -r "$_sepoch" '+%a' 2>/dev/null)
-      _sck=$(date -r "$_sepoch" '+%-I%p' 2>/dev/null | tr '[:upper:]' '[:lower:]')
-      [ -n "$_swd" ] && [ -n "$_sck" ] && scoped_str="${scoped_str} (${_swd} ${_sck})"
+    [ -n "$_sepoch" ] && [ "$_sepoch" -le "$_now_epoch" ] && continue
+    _sstr="${_sname}: $(awk -v u="$_spct" 'BEGIN{printf "%.0f", u}')%"
+    _sceil=0 _srst=""
+    if [ -n "$_sepoch" ]; then
+      _sceil=$(_ceil30 "$_sepoch")
+      _swd=$(date -r "$_sceil" '+%a' 2>/dev/null)
+      _sck=$(_clock "$_sceil")
+      [ -n "$_swd" ] && [ -n "$_sck" ] && _srst=" (${_swd} ${_sck})"
     fi
-    limit_fields+=("${DIM}${scoped_str}${RESET}")
+    scoped_strs+=("$_sstr") scoped_ceils+=("$_sceil") scoped_resets+=("$_srst")
+    # The bucket scoped to the SESSION's model (name-contained either way,
+    # e.g. bucket "fable" in a "Fable 5" session) gets promoted below.
+    if [ -z "$scoped_session_idx" ]; then
+      case "$_model_lc" in
+        *"$_sname"*) scoped_session_idx=$(( ${#scoped_strs[@]} - 1 )) ;;
+        *) case "$_sname" in *"$_model_lc"*) scoped_session_idx=$(( ${#scoped_strs[@]} - 1 )) ;; esac ;;
+      esac
+    fi
   done <<< "$_scoped_rows"
+fi
+
+# Weekly-bucket order: a session running a model with its own weekly bucket
+# promotes that bucket next to 5h, where the binding limit belongs; wk and
+# the other buckets follow. The second-position weekly bucket always carries
+# its reset clock; later buckets repeat one only when their CEILED reset
+# actually differs (all ride the same weekly cycle anchor, so one clock
+# normally covers them, and raw resets minutes apart would render identically
+# anyway). Session model with no scoped bucket in the cache -> wk keeps
+# second position and its clock, the old layout exactly.
+_emit_scoped() {  # append all scoped buckets except index $1, clocks deduped against ceil $2
+  local _skip=$1 _anchor=$2 _i _rst
+  for (( _i=0; _i<${#scoped_strs[@]}; _i++ )); do
+    [ "$_i" = "$_skip" ] && continue
+    _rst=${scoped_resets[$_i]}
+    [ "${scoped_ceils[$_i]}" = "$_anchor" ] && _rst=""
+    limit_fields+=("${DIM}${scoped_strs[$_i]}${_rst}${RESET}")
+  done
+}
+if [ -n "$scoped_session_idx" ]; then
+  _anchor_ceil=${scoped_ceils[$scoped_session_idx]}
+  limit_fields+=("${DIM}${scoped_strs[$scoped_session_idx]}${scoped_resets[$scoped_session_idx]}${RESET}")
+  if [ -n "$seven_day_str" ]; then
+    _rst=$seven_day_reset
+    [ "$seven_day_ceil" = "$_anchor_ceil" ] && _rst=""
+    limit_fields+=("${DIM}${seven_day_str}${_rst}${RESET}")
+  fi
+  _emit_scoped "$scoped_session_idx" "$_anchor_ceil"
+else
+  [ -n "$seven_day_str" ] && limit_fields+=("${DIM}${seven_day_str}${seven_day_reset}${RESET}")
+  _emit_scoped "" "$seven_day_ceil"
 fi
 
 # Background refresh of the usage cache, at most every ~2 min, never blocking
