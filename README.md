@@ -26,22 +26,26 @@ claude-doctor      # health check: links, marker, transcript timefix,
 /switch work
 ```
 
-One confirmation line, the process restarts itself, and about a second later you are in the same conversation, billing the other account, with the same model and effort level. Mechanics: the command mechanically arms a request file, a Stop hook terminates the idle process after the transcript is fully flushed, and the wrapper loop relaunches the target profile with `--continue`, passing the dying session's model and effort explicitly.
+One confirmation line, the process restarts itself, and about a second later you are in the same conversation, billing the other account, with the same model and effort level. Three layers make this robust:
+
+- **Instant and quota-proof.** A UserPromptSubmit hook handles a typed `/switch` entirely client-side, before any API call: zero tokens spent, and it works even when the account is hard-limited (exactly when you need it most; the model-driven path would need a turn it can't get).
+- **Worktree-safe resume.** The dying session's model, effort, working directory, and session id are stamped on the request file, and the wrapper relaunches with `--resume <session-id>` from the directory that actually owns the transcript. A session that entered a git worktree mid-conversation (its transcript re-homes under the worktree's project slug) resumes correctly instead of landing in the wrong conversation; when no validated pair can be stamped, it degrades to `--continue` from the launch dir and says so.
+- **Fallback command path.** The `/switch` slash command + Stop hook remain as the fallback when the prompt hook is absent or disabled, and for worktree-isolated sessions, where the harness doesn't deliver slash commands to prompt hooks at all. Its arming step is a single plain script call, which the worktree Bash guard permits (a compound preamble gets refused as unverifiable).
 
 **A statusline that answers the questions you actually have:**
 
 ```
-Opus 5 · high | 6% ctx | $0.70
-work | 5h: 4% (7:10pm) | wk: 47% (Tue 11pm)
+Fable 5 · high | 6% ctx | 3:19am · warm | $0.70
+work | 5h: 4% (7:30pm) | fable: 62% (Sat 3pm) | wk: 47%
 ✎ ↑2 | ⎇ main | myrepo
 ```
 
-Row 1: model, effort, context used, session cost. Row 2: account tag first (so you always know who is billing), then 5-hour and weekly usage with reset times, plus any per-model weekly buckets your account carries. Usage renders from a small per-account cache refreshed in the background, so every terminal of the same account shows the same, current numbers instead of each session's stale view. Row 3: git state (✎ uncommitted changes, ↑N commits that exist only on this machine, ∆N commits not yet merged to main), branch, worktree, repo name; in a non-git directory it shows the folder and path instead. Every segment hides when it has nothing to say.
+Row 1: model, effort, context used, prompt-cache warmth, session cost. The warmth segment shows whether the conversation's server-side prompt cache is still live and until when ("3:19am · warm"), or "cold" (the next message re-ingests the full history — also the cheap moment to `/compact`). Row 2: account tag first (so you always know who is billing), then the 5-hour window, then the weekly buckets. When the session's model carries its own weekly bucket, that bucket is promoted next to the 5-hour segment (it's usually the binding limit) with the weekly bucket following; reset clocks are shown once, repeated only when they actually differ, and always rounded UP to the next half-hour so a shown time may read late but never early. Usage renders from a small per-account cache refreshed in the background, so every terminal of the same account shows the same, current numbers instead of each session's stale view. Row 3: git state (✎ uncommitted changes, ↑N commits that exist only on this machine, ∆N commits not yet merged to main), branch, worktree, repo name; in a non-git directory it shows the folder and path instead. Every segment hides when it has nothing to say.
 
 ## Requirements
 
 - macOS (keychain, BSD `stat`/`date`; Linux would need light porting)
-- Claude Code with subscription login (verified on v2.1.220)
+- Claude Code with subscription login (verified on v2.1.220; the /switch worktree and quota paths re-verified on v2.1.227)
 - `jq`
 - zsh (the wrappers; the statusline and hook are plain bash)
 
@@ -54,7 +58,9 @@ Row 1: model, effort, context used, session cost. Row 2: account tag first (so y
 ```sh
 cp profiles.zsh ~/.claude/profiles.zsh
 cp statusline-command.sh ~/.claude/statusline-command.sh
+cp switch-arm.sh ~/.claude/switch-arm.sh
 cp hooks/switch-stop-hook.sh ~/.claude/switch-stop-hook.sh
+cp hooks/switch-prompt-hook.sh ~/.claude/switch-prompt-hook.sh
 mkdir -p ~/.claude/commands && cp commands/switch.md ~/.claude/commands/switch.md
 echo 'source ~/.claude/profiles.zsh' >> ~/.zshrc
 ```
@@ -68,6 +74,17 @@ echo 'source ~/.claude/profiles.zsh' >> ~/.zshrc
     "command": "bash ~/.claude/statusline-command.sh"
   },
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/switch-prompt-hook.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
@@ -115,12 +132,13 @@ Adding an account later: add a line to `profiles.conf`, open a fresh terminal, l
 - **The background usage poll is optional.** It reads only your own account's meter with your own token, via an endpoint that is not officially documented. If you would rather not use it, delete the "Background refresh" block in the statusline: the usage and per-model segments simply stay absent and everything else keeps working.
 - **The wrappers skip permission prompts** (`--dangerously-skip-permissions`), matching how many people run their own trusted machine. If you want prompts, edit the two lines in `profiles.zsh` that pass the flag.
 - **Cross-account switches re-read the conversation.** Prompt caches are per account, so `/switch` late in a long session makes the target account pay a full uncached read of the history. Switch early, or accept the cost.
+- **Worktree-isolated sessions switch via the command path.** The harness does not deliver slash commands to UserPromptSubmit hooks in worktree-isolated sessions, so the quota-proof layer can't fire there; `/switch` falls through to the command + Stop-hook path, which works but needs one model turn to complete. Hard-limited AND worktree-isolated at once: the switch arms immediately and completes at the end of the first turn that runs (switch to a non-limited model with `/model` to get one).
 - **Sessions are shared across profiles** (deliberately): `~/.claude/projects` is on the shared list, so any profile can `--continue` any conversation and agent memory persists across accounts. If you want hard separation of conversation history between accounts, remove `projects` and `history.jsonl` from `_CLAUDE_SHARED` before first launch.
 - `claude-doctor` (shell function) is unrelated to the built-in `claude doctor` subcommand.
 
 ## How it works
 
-Short version: `CLAUDE_CONFIG_DIR` gives each account an isolated home including its own keychain credential slot; symlinks give all homes one shared brain; a marker file gives `claude-skip` its memory; and `/switch` is a three-part handshake between a slash command (arms a request), a Stop hook (terminates the idle process only after the transcript is flushed, stamping the session's model and effort), and the wrapper loop (relaunches the target profile with `--continue`). The long version, with everything we verified empirically, is in [docs/internals.md](docs/internals.md).
+Short version: `CLAUDE_CONFIG_DIR` gives each account an isolated home including its own keychain credential slot; symlinks give all homes one shared brain; a marker file gives `claude-skip` its memory; and `/switch` is a handshake between an arming step (the prompt hook for a typed `/switch`, or the slash command's plain `switch-arm.sh` call as fallback), a kill step (the prompt hook immediately, or the Stop hook after the turn ends — either way only after the transcript is flushed, with the session's model, effort, directory, and session id stamped on the request), and the wrapper loop (relaunches the target profile with `--resume <session-id>` from the conversation's own directory, `--continue` as the degraded fallback). The long version, with everything we verified empirically, is in [docs/internals.md](docs/internals.md).
 
 ## License
 
